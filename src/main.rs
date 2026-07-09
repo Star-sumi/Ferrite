@@ -241,9 +241,11 @@ fn main() -> eframe::Result<()> {
 
     // Load settings to get configuration (including log level and language)
     let settings = load_config();
+    diag::trace("settings loaded");
 
     // Apply saved language setting for i18n
     set_locale(settings.language.locale_code());
+    diag::trace("locale applied");
 
     // Determine effective log level: CLI > config > default (Warn)
     let effective_log_level = cli.log_level.unwrap_or(settings.log_level);
@@ -289,6 +291,7 @@ fn main() -> eframe::Result<()> {
 
     // Load application icon
     let app_icon = get_app_icon();
+    diag::trace("application icon checked");
     if app_icon.is_some() {
         info!("Application icon loaded successfully");
     }
@@ -328,12 +331,13 @@ fn main() -> eframe::Result<()> {
         run_and_return: true,
         ..Default::default()
     };
+    diag::trace("native options ready");
 
     log_memory("Before eframe::run_native");
 
     // Run the application
     diag::trace("calling eframe::run_native");
-    eframe::run_native(
+    let result = eframe::run_native(
         APP_NAME,
         native_options,
         Box::new(move |cc| {
@@ -354,8 +358,11 @@ fn main() -> eframe::Result<()> {
             }
 
             log_memory("After app creation and initial paths");
+            diag::trace("initial paths handled");
 
             Ok(Box::new(app))
         }),
-    )
+    );
+    diag::trace("eframe::run_native returned");
+    result
 }
