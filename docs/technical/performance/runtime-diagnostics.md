@@ -1,6 +1,7 @@
 # Runtime Diagnostics
 
-Ferrite has an opt-in runtime diagnostics path for startup and UI frame timing.
+Ferrite has an opt-in runtime diagnostics path for startup and
+`FerriteApp::update` timing.
 It is disabled by default and writes to a temp-file trace when enabled:
 
 ```powershell
@@ -33,21 +34,21 @@ Startup milestones:
 - `FerriteApp::new`
 - initial path handling
 
-Frame milestones:
+Update-loop milestones:
 
-- first UI frame
-- first ten frames
-- every 60th frame marker
-- slow frames over the configured threshold
-- every 300 frames: sample count, p50, p95, p99, max, frames over 16 ms,
-  frames over 32 ms, and frames over the slow-frame threshold
+- first `FerriteApp::update` call
+- first ten update calls
+- every 60th update marker
+- slow update calls over the configured threshold
+- every 300 update calls: sample count, p50, p95, p99, max, updates over
+  16 ms, updates over 32 ms, and updates over the slow-update threshold
 
 ## Interpretation
 
 Use this as a measurement scaffold, not as a benchmark suite. The next
 measurement phase should capture logs for:
 
-- cold launch to first frame
+- cold launch to first `FerriteApp::update`
 - small Markdown open
 - large Markdown open
 - typing for 30 seconds

@@ -4928,6 +4928,8 @@ fn open_link_target(target: &OpenableLinkTarget) -> std::io::Result<()> {
 // Mermaid Diagram Widget
 // ─────────────────────────────────────────────────────────────────────────────
 
+const MERMAID_AUTO_RENDER_CHAR_LIMIT: usize = 3_000;
+
 /// The type of Mermaid diagram detected from source.
 ///
 /// MermaidJS supports various diagram types, each with its own syntax.
@@ -5097,6 +5099,11 @@ pub fn detect_mermaid_diagram_type(source: &str) -> MermaidDiagramType {
     }
 }
 
+fn should_show_mermaid_source_by_default(source: &str, diagram_type: MermaidDiagramType) -> bool {
+    matches!(diagram_type, MermaidDiagramType::Flowchart)
+        && source.chars().count() > MERMAID_AUTO_RENDER_CHAR_LIMIT
+}
+
 /// Data for a mermaid diagram block.
 #[derive(Debug, Clone)]
 pub struct MermaidBlockData {
@@ -5128,11 +5135,12 @@ impl MermaidBlockData {
     pub fn new(source: impl Into<String>) -> Self {
         let source = source.into();
         let diagram_type = detect_mermaid_diagram_type(&source);
+        let show_source = should_show_mermaid_source_by_default(&source, diagram_type);
         Self {
             original_source: source.clone(),
             source,
             diagram_type,
-            show_source: false, // Default to rendered diagram view
+            show_source,
             rendered_svg: None,
             render_error: None,
             is_rendering: false,
@@ -6724,9 +6732,35 @@ mod tests {
         let data = MermaidBlockData::new("flowchart TD\n  A --> B");
         assert_eq!(data.diagram_type, MermaidDiagramType::Flowchart);
         assert!(!data.is_modified());
-        assert!(!data.show_source); // Default to rendered diagram view
+        assert!(!data.show_source);
         assert!(data.rendered_svg.is_none());
         assert!(data.render_error.is_none());
+    }
+
+    #[test]
+    fn test_mermaid_block_data_large_flowchart_defaults_to_source_view() {
+        let mut source = String::from("flowchart TD\n");
+        while source.chars().count() <= MERMAID_AUTO_RENDER_CHAR_LIMIT {
+            source.push_str("  A --> B\n");
+        }
+
+        let data = MermaidBlockData::new(source);
+
+        assert_eq!(data.diagram_type, MermaidDiagramType::Flowchart);
+        assert!(data.show_source);
+    }
+
+    #[test]
+    fn test_mermaid_block_data_large_non_flowchart_keeps_rendered_default() {
+        let mut source = String::from("sequenceDiagram\n");
+        while source.chars().count() <= MERMAID_AUTO_RENDER_CHAR_LIMIT {
+            source.push_str("  Alice->>Bob: Hello\n");
+        }
+
+        let data = MermaidBlockData::new(source);
+
+        assert_eq!(data.diagram_type, MermaidDiagramType::Sequence);
+        assert!(!data.show_source);
     }
 
     #[test]

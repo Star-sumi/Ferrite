@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-const FRAME_SUMMARY_INTERVAL: u64 = 300;
+const UPDATE_SUMMARY_INTERVAL: u64 = 300;
 
 thread_local! {
-    static FRAME: Cell<u64> = const { Cell::new(0) };
-    static FRAME_START: Cell<Option<Instant>> = const { Cell::new(None) };
-    static FRAME_METRICS: RefCell<FrameMetrics> = RefCell::new(FrameMetrics::default());
+    static UPDATE: Cell<u64> = const { Cell::new(0) };
+    static UPDATE_START: Cell<Option<Instant>> = const { Cell::new(None) };
+    static UPDATE_METRICS: RefCell<UpdateMetrics> = RefCell::new(UpdateMetrics::default());
 }
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -24,7 +24,7 @@ static TRACE_PATH: OnceLock<PathBuf> = OnceLock::new();
 static START_INSTANT: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Default)]
-struct FrameMetrics {
+struct UpdateMetrics {
     samples_ms: Vec<f64>,
     max_ms: f64,
     over_16ms: u64,
@@ -32,7 +32,7 @@ struct FrameMetrics {
     over_threshold: u64,
 }
 
-impl FrameMetrics {
+impl UpdateMetrics {
     fn reset(&mut self) {
         self.samples_ms.clear();
         self.max_ms = 0.0;
@@ -108,47 +108,67 @@ fn chrono_lite_timestamp() -> String {
     format!("{:?}", std::time::SystemTime::now())
 }
 
-/// Advance the per-frame counter (call once per `App::update`).
-pub fn next_frame() -> u64 {
-    FRAME_START.with(|c| c.set(Some(Instant::now())));
-    let n = FRAME.with(|c| {
+/// Start one `FerriteApp::update` diagnostics sample.
+pub fn update_start() -> u64 {
+    UPDATE_START.with(|c| c.set(Some(Instant::now())));
+    let n = UPDATE.with(|c| {
         let n = c.get() + 1;
         c.set(n);
         n
     });
     if enabled() && n == 1 {
-        trace("first UI frame started");
+        trace("first FerriteApp::update started");
     } else if enabled() && n <= 10 {
-        trace(&format!("UI frame {n} started"));
+        trace(&format!("FerriteApp::update #{n} started"));
     } else if enabled() && n % 60 == 0 {
-        trace(&format!("UI frame {n}"));
+        trace(&format!("FerriteApp::update #{n}"));
     }
     n
 }
 
-/// Log when the previous frame's `update()` exceeded `threshold_ms`.
-pub fn frame_end(threshold_ms: u64) {
+/// Finish the current `FerriteApp::update` sample.
+pub fn update_end(threshold_ms: u64) {
     if !enabled() {
         return;
     }
-    let Some(start) = FRAME_START.with(|c| c.get()) else {
+    let Some(start) = UPDATE_START.with(|c| c.get()) else {
         return;
     };
     let elapsed = start.elapsed();
-    let frame = FRAME.with(|c| c.get());
-    record_frame_metrics(frame, elapsed, threshold_ms);
-    if elapsed >= Duration::from_millis(threshold_ms) {
+    let update = UPDATE.with(|c| c.get());
+    record_update_metrics(update, elapsed, threshold_ms);
+    if update <= 10 {
         trace(&format!(
-            "UI frame {} took {:.0}ms (SLOW)",
-            frame,
+            "FerriteApp::update #{} finished in {:.0}ms",
+            update,
+            elapsed.as_secs_f64() * 1000.0
+        ));
+    } else if elapsed >= Duration::from_millis(threshold_ms) {
+        trace(&format!(
+            "FerriteApp::update #{} took {:.0}ms (SLOW)",
+            update,
             elapsed.as_secs_f64() * 1000.0
         ));
     }
 }
 
-fn record_frame_metrics(frame: u64, elapsed: Duration, threshold_ms: u64) {
+/// Record a named checkpoint inside the current update call.
+pub fn update_checkpoint(label: &'static str) {
+    if !enabled() {
+        return;
+    }
+    let update = UPDATE.with(|c| c.get());
+    if update > 0 && update <= 10 {
+        trace(&format!(
+            "FerriteApp::update #{} checkpoint: {}",
+            update, label
+        ));
+    }
+}
+
+fn record_update_metrics(update: u64, elapsed: Duration, threshold_ms: u64) {
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-    FRAME_METRICS.with(|cell| {
+    UPDATE_METRICS.with(|cell| {
         let mut metrics = cell.borrow_mut();
         metrics.samples_ms.push(elapsed_ms);
         metrics.max_ms = metrics.max_ms.max(elapsed_ms);
@@ -162,13 +182,13 @@ fn record_frame_metrics(frame: u64, elapsed: Duration, threshold_ms: u64) {
             metrics.over_threshold += 1;
         }
 
-        if frame > 0 && frame % FRAME_SUMMARY_INTERVAL == 0 && !metrics.samples_ms.is_empty() {
+        if update > 0 && update % UPDATE_SUMMARY_INTERVAL == 0 && !metrics.samples_ms.is_empty() {
             let mut samples = metrics.samples_ms.clone();
             samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
             trace(&format!(
-                "frame summary through frame {}: samples={}, p50={:.1}ms, p95={:.1}ms, p99={:.1}ms, max={:.1}ms, >=16ms={}, >=32ms={}, >=threshold({}ms)={}",
-                frame,
+                "FerriteApp::update summary through update #{}: samples={}, p50={:.1}ms, p95={:.1}ms, p99={:.1}ms, max={:.1}ms, updates>=16ms={}, updates>=32ms={}, updates>=threshold({}ms)={}",
+                update,
                 samples.len(),
                 percentile(&samples, 0.50),
                 percentile(&samples, 0.95),
@@ -218,10 +238,10 @@ impl Drop for SlowScope {
         let elapsed = self.start.elapsed();
         if elapsed >= self.threshold {
             trace(&format!(
-                "slow {} {:.0}ms (frame {})",
+                "slow {} {:.0}ms (update #{})",
                 self.label,
                 elapsed.as_secs_f64() * 1000.0,
-                FRAME.with(|c| c.get())
+                UPDATE.with(|c| c.get())
             ));
         }
     }
@@ -248,7 +268,7 @@ pub fn event_once(key: &'static str, message: impl AsRef<str>) {
     }
 }
 
-/// Repeatable event (rate-limited to avoid log spam).
+/// Repeatable event.
 pub fn event(key: &'static str, message: impl AsRef<str>) {
     if !enabled() {
         return;

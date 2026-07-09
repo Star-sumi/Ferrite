@@ -210,6 +210,8 @@ pub struct GitService {
     repo: Option<Repository>,
     /// Root path of the repository
     repo_root: Option<PathBuf>,
+    /// Path opened as the workspace, used to scope expensive status scans.
+    status_scope: Option<PathBuf>,
     /// Cached file statuses (relative path -> status)
     file_statuses: HashMap<PathBuf, GitFileStatus>,
     /// Whether status cache is valid
@@ -220,6 +222,7 @@ impl std::fmt::Debug for GitService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitService")
             .field("repo_root", &self.repo_root)
+            .field("status_scope", &self.status_scope)
             .field("is_open", &self.repo.is_some())
             .field("file_statuses_count", &self.file_statuses.len())
             .field("cache_valid", &self.cache_valid)
@@ -239,6 +242,7 @@ impl GitService {
         Self {
             repo: None,
             repo_root: None,
+            status_scope: None,
             file_statuses: HashMap::new(),
             cache_valid: false,
         }
@@ -263,6 +267,7 @@ impl GitService {
                 );
 
                 self.repo_root = repo_root;
+                self.status_scope = Some(path.to_path_buf());
                 self.repo = Some(repo);
                 self.cache_valid = false;
                 Ok(true)
@@ -284,6 +289,7 @@ impl GitService {
     pub fn close(&mut self) {
         self.repo = None;
         self.repo_root = None;
+        self.status_scope = None;
         self.file_statuses.clear();
         self.cache_valid = false;
     }
@@ -351,22 +357,35 @@ impl GitService {
             return;
         }
 
+        crate::diag::update_checkpoint("git status cache update start");
+        let _diag_scope = crate::diag::SlowScope::new("git status cache update", 50);
         self.file_statuses.clear();
 
         let Some(repo) = &self.repo else {
+            crate::diag::update_checkpoint("git status cache no repo");
             return;
         };
 
         // Configure status options
         let mut opts = StatusOptions::new();
         opts.include_untracked(true)
-            .recurse_untracked_dirs(true)
-            .include_ignored(true) // Show ignored files with gray indicator
+            .recurse_untracked_dirs(false)
+            .include_ignored(false)
             .include_unmodified(false);
+        if let (Some(repo_root), Some(scope)) = (&self.repo_root, &self.status_scope) {
+            if let Some(scope_rel) = repo_relative_path(scope, repo_root) {
+                if !scope_rel.as_os_str().is_empty() {
+                    let pathspec = scope_rel.as_os_str().to_string_lossy().replace('\\', "/");
+                    opts.pathspec(pathspec);
+                }
+            }
+        }
 
         // Get all statuses
+        crate::diag::update_checkpoint("git status repo.statuses start");
         match repo.statuses(Some(&mut opts)) {
             Ok(statuses) => {
+                crate::diag::update_checkpoint("git status repo.statuses done");
                 for entry in statuses.iter() {
                     if let Some(path) = entry.path() {
                         let status = GitFileStatus::from_git2_status(entry.status());
@@ -385,6 +404,7 @@ impl GitService {
                 warn!("Error getting Git statuses: {}", e);
             }
         }
+        crate::diag::update_checkpoint("git status cache update done");
     }
 
     /// Get the Git status for a specific file.
@@ -427,9 +447,21 @@ impl GitService {
     ///
     /// This is useful for passing to UI components that need to look up
     /// statuses for multiple files. The returned map uses absolute paths.
+    #[allow(dead_code)] // Public API for explicit refresh + snapshot callers.
     pub fn get_all_statuses(&mut self) -> HashMap<PathBuf, GitFileStatus> {
+        crate::diag::update_checkpoint("git get_all_statuses enter");
+        let _diag_scope = crate::diag::SlowScope::new("git get_all_statuses", 50);
         self.update_status_cache();
+        crate::diag::update_checkpoint("git get_all_statuses cache ready");
+        self.cached_all_statuses()
+    }
 
+    /// Get currently cached statuses without refreshing the cache.
+    ///
+    /// UI rendering should use this method so a paint pass never blocks on
+    /// `git status`. Refresh is driven by explicit or debounced background
+    /// refresh paths.
+    pub fn cached_all_statuses(&self) -> HashMap<PathBuf, GitFileStatus> {
         let Some(repo_root) = &self.repo_root else {
             return HashMap::new();
         };
@@ -543,7 +575,7 @@ impl GitAutoRefresh {
     /// Create a new GitAutoRefresh manager.
     pub fn new() -> Self {
         Self {
-            last_refresh: None,
+            last_refresh: Some(Instant::now()),
             last_request: None,
             pending_refresh: false,
             was_focused: true, // Assume focused at start
@@ -758,6 +790,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_git_service_status_refresh_is_scoped_to_opened_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        let repo = Repository::init(repo_path).unwrap();
+
+        let workspace = repo_path.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let inside_file = workspace.join("inside.txt");
+        let outside_file = repo_path.join("outside.txt");
+        fs::write(&inside_file, "inside").unwrap();
+        fs::write(&outside_file, "outside").unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("workspace/inside.txt")).unwrap();
+        index.add_path(Path::new("outside.txt")).unwrap();
+        index.write().unwrap();
+
+        let mut service = GitService::new();
+        service.open(&workspace).unwrap();
+        service.refresh_status();
+
+        let statuses = service.cached_all_statuses();
+        assert!(
+            statuses.contains_key(&inside_file),
+            "expected workspace status in cache: {statuses:?}"
+        );
+        assert!(
+            !statuses.contains_key(&outside_file),
+            "status cache should not include paths outside opened workspace: {statuses:?}"
+        );
+    }
+
+    #[test]
+    fn test_git_service_cached_all_statuses_does_not_refresh() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        Repository::init(repo_path).unwrap();
+
+        let mut service = GitService::new();
+        service.open(repo_path).unwrap();
+        service.cache_valid = false;
+        service
+            .file_statuses
+            .insert(PathBuf::from("cached.txt"), GitFileStatus::Modified);
+
+        let statuses = service.cached_all_statuses();
+
+        assert_eq!(
+            statuses.get(&repo_path.join("cached.txt")),
+            Some(&GitFileStatus::Modified)
+        );
+        assert!(!service.cache_valid);
+    }
+
     #[cfg(windows)]
     #[test]
     fn test_repo_relative_path_handles_windows_verbatim_prefix() {
@@ -828,7 +915,7 @@ mod tests {
     #[test]
     fn test_git_auto_refresh_new() {
         let refresh = GitAutoRefresh::new();
-        assert!(refresh.last_refresh.is_none());
+        assert!(refresh.last_refresh.is_some());
         assert!(refresh.last_request.is_none());
         assert!(!refresh.pending_refresh);
         assert!(refresh.was_focused); // Assumes focused at start
@@ -837,7 +924,7 @@ mod tests {
     #[test]
     fn test_git_auto_refresh_default() {
         let refresh = GitAutoRefresh::default();
-        assert!(refresh.last_refresh.is_none());
+        assert!(refresh.last_refresh.is_some());
         assert!(!refresh.pending_refresh);
     }
 
@@ -875,9 +962,16 @@ mod tests {
     }
 
     #[test]
-    fn test_git_auto_refresh_periodic_refresh_never_refreshed() {
+    fn test_git_auto_refresh_periodic_refresh_initially_delayed() {
         let refresh = GitAutoRefresh::new();
-        // Should refresh if never refreshed before
+        assert!(!refresh.should_periodic_refresh());
+    }
+
+    #[test]
+    fn test_git_auto_refresh_periodic_refresh_after_interval() {
+        let mut refresh = GitAutoRefresh::new();
+        refresh.last_refresh = Some(Instant::now() - GIT_REFRESH_INTERVAL - Duration::from_secs(1));
+
         assert!(refresh.should_periodic_refresh());
     }
 
@@ -915,10 +1009,9 @@ mod tests {
     fn test_git_auto_refresh_tick_with_workspace_first_time() {
         let mut refresh = GitAutoRefresh::new();
 
-        // Should trigger refresh on first tick with workspace
-        // (because never refreshed before, periodic triggers)
+        // Initial periodic refresh is delayed so first paint is not blocked by git status.
         let should_refresh = refresh.tick(true);
-        assert!(should_refresh);
+        assert!(!should_refresh);
     }
 
     #[test]

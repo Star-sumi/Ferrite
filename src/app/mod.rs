@@ -1559,6 +1559,7 @@ impl FerriteApp {
         let is_maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
         let is_dark = ctx.global_style().visuals.dark_mode;
         let zen_mode = self.state.is_zen_mode();
+        crate::diag::update_checkpoint("render_ui start");
 
         // Title bar colors
         let title_bar_color = if is_dark {
@@ -1591,6 +1592,7 @@ impl FerriteApp {
                 text_color,
             );
         }
+        crate::diag::update_checkpoint("render_ui title bar done");
 
         // View menu removed - Productivity Hub is now accessible via ribbon icon and outline panel tab
 
@@ -1676,6 +1678,7 @@ impl FerriteApp {
         } else {
             None
         };
+        crate::diag::update_checkpoint("render_ui ribbon done");
 
         // Handle ribbon actions - defer format actions until after editor renders
         // IMPORTANT: Capture selection NOW, before the editor might lose focus
@@ -1767,7 +1770,9 @@ impl FerriteApp {
 
         // Status bar - hidden in Zen Mode
         if !zen_mode {
+            crate::diag::update_checkpoint("status bar start");
             let (rainbow_toggle, encoding_change) = self.render_status_bar(ui, is_dark);
+            crate::diag::update_checkpoint("status bar done");
             if rainbow_toggle {
                 self.state.settings.csv_rainbow_columns = !self.state.settings.csv_rainbow_columns;
                 self.state.mark_settings_dirty();
@@ -1794,15 +1799,19 @@ impl FerriteApp {
         // Side panel toggle strip (shown when outline panel is closed, hidden in Zen Mode)
         let blocks_resize_clicks = self.window_resize_state.blocks_widget_clicks();
         if !self.state.settings.outline_enabled && !zen_mode {
+            crate::diag::update_checkpoint("side panel toggle strip start");
             if crate::ui::side_panel_toggle_strip(ui, is_dark, blocks_resize_clicks) {
                 self.state.settings.outline_enabled = true;
                 self.state.mark_settings_dirty();
             }
+            crate::diag::update_checkpoint("side panel toggle strip done");
         }
 
         if self.state.settings.outline_enabled && !zen_mode {
             // Update outline if content changed
+            crate::diag::update_checkpoint("outline update start");
             self.update_outline_if_needed();
+            crate::diag::update_checkpoint("outline update done");
 
             // Determine current section based on cursor position
             let current_line = self
@@ -1811,6 +1820,7 @@ impl FerriteApp {
                 .map(|t| t.cursor_position.0 + 1) // Convert to 1-indexed
                 .unwrap_or(0);
             let current_section = self.cached_outline.find_current_section(current_line);
+            crate::diag::update_checkpoint("outline current section done");
 
             // Detect tab switch and refresh backlinks
             let current_tab_idx = self.state.active_tab_index();
@@ -1818,10 +1828,13 @@ impl FerriteApp {
                 self.last_active_tab_for_backlinks = current_tab_idx;
                 self.backlinks_need_refresh = true;
             }
+            crate::diag::update_checkpoint("backlink tab switch check done");
 
             // Refresh backlinks if needed (tab switch or file save)
             if self.backlinks_need_refresh {
+                crate::diag::update_checkpoint("backlinks refresh start");
                 self.refresh_backlinks();
+                crate::diag::update_checkpoint("backlinks refresh done");
                 self.backlinks_need_refresh = false;
             }
 
@@ -1832,6 +1845,7 @@ impl FerriteApp {
                 .map(|t| t.file_type() == FileType::Markdown)
                 .unwrap_or(false);
             if is_markdown {
+                crate::diag::update_checkpoint("frontmatter update start");
                 if let Some(tab) = self.state.active_tab() {
                     let tab_id = tab.id;
                     let ver = tab.content_version();
@@ -1839,15 +1853,18 @@ impl FerriteApp {
                     self.frontmatter_panel
                         .update_from_content_versioned(content_ref, tab_id, ver);
                 }
+                crate::diag::update_checkpoint("frontmatter update done");
             }
 
             // Configure and render the outline panel
+            crate::diag::update_checkpoint("outline panel configure start");
             self.outline_panel
                 .set_side(self.state.settings.outline_side);
             self.outline_panel.set_current_section(current_section);
             let docked = self.state.settings.productivity_panel_docked;
             let runtime_modules =
                 RuntimeModulesInfo::collect(self.terminal_panel_state.manager.terminal_count());
+            crate::diag::update_checkpoint("outline panel show start");
             let outline_output = self.outline_panel.show(
                 ui,
                 &self.cached_outline,
@@ -1867,6 +1884,7 @@ impl FerriteApp {
                     None
                 },
             );
+            crate::diag::update_checkpoint("outline panel show done");
 
             // Capture output for processing after render
             if let Some(line) = outline_output.scroll_to_line {
@@ -1970,11 +1988,13 @@ impl FerriteApp {
 
         if self.state.should_show_file_tree() && !zen_mode {
             // Get Git statuses first (needs mutable borrow)
+            crate::diag::update_checkpoint("file tree git statuses start");
             let git_statuses = if self.state.git_service.is_open() {
-                Some(self.state.git_service.get_all_statuses())
+                Some(self.state.git_service.cached_all_statuses())
             } else {
                 None
             };
+            crate::diag::update_checkpoint("file tree git statuses done");
 
             if let Some(workspace) = &self.state.workspace {
                 let workspace_name = workspace
@@ -1987,6 +2007,7 @@ impl FerriteApp {
                     .state
                     .active_tab()
                     .and_then(|tab| tab.path.as_deref());
+                crate::diag::update_checkpoint("file tree panel show start");
                 let output = self.file_tree_panel.show(
                     ui,
                     &workspace.file_tree,
@@ -1996,6 +2017,7 @@ impl FerriteApp {
                     active_tab_path,
                     self.state.settings.ferrite_accent_rgb(),
                 );
+                crate::diag::update_checkpoint("file tree panel show done");
 
                 file_tree_file_clicked = output.file_clicked;
                 file_tree_path_toggled = output.path_toggled;
@@ -2329,11 +2351,14 @@ impl FerriteApp {
                 self.state.mark_settings_dirty();
             }
         }
+        crate::diag::update_checkpoint("render_ui side panels done");
 
         // Central panel for editor content
 
         // Central panel for editor content
+        crate::diag::update_checkpoint("render_ui central panel start");
         let central_deferred = self.render_central_panel(ui, is_dark, frame);
+        crate::diag::update_checkpoint("render_ui central panel done");
         if central_deferred.is_some() {
             deferred_format_action = central_deferred;
         }
@@ -2692,13 +2717,16 @@ impl eframe::App for FerriteApp {
         } else {
             false
         };
+        crate::diag::update_checkpoint("ui pre-render input handled");
 
         // Ensure echo worker is spawned if AI panel is visible (lazy initialization)
         #[cfg(feature = "async-workers")]
         self.ensure_echo_worker();
 
         // Render the main UI (this updates editor selection)
+        crate::diag::update_checkpoint("ui render_ui start");
         let deferred_format = self.render_ui(ui, frame);
+        crate::diag::update_checkpoint("ui render_ui done");
 
         for msg in drain_code_execution_toasts(&ctx) {
             self.state.show_toast(msg, self.get_app_time(), 5.0);
@@ -2749,7 +2777,7 @@ impl eframe::App for FerriteApp {
 
     /// Called each time the UI needs repainting.
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        crate::diag::next_frame();
+        crate::diag::update_start();
         self.video_foreground_occluders.clear();
 
         #[cfg(windows)]
@@ -2783,6 +2811,7 @@ impl eframe::App for FerriteApp {
             self.platform_init_done = true;
             platform::install_platform_hooks();
         }
+        crate::diag::update_checkpoint("platform and window input done");
 
         // Check if the platform hook intercepted Alt+Space this frame
         if platform::take_palette_toggle_from_hook() {
@@ -2801,6 +2830,7 @@ impl eframe::App for FerriteApp {
         // Warm per-frame caches (is_modified) for all tabs so that
         // title() and is_modified() calls via &self are O(1) this frame.
         self.state.warm_tab_caches();
+        crate::diag::update_checkpoint("theme fonts and tab caches done");
 
         // Track user interaction for idle detection
         // This updates the last interaction time when any user input is detected,
@@ -2884,32 +2914,41 @@ impl eframe::App for FerriteApp {
                 }
             }
         }
+        crate::diag::update_checkpoint("title and geometry done");
 
         // Track primary window geometry for persistence
         self.update_window_geometry_for(crate::state::PRIMARY_WINDOW_ID, ctx);
+        crate::diag::update_checkpoint("primary geometry persisted");
 
         // Poll for file paths from secondary instances (single-instance protocol)
         self.handle_instance_paths(ctx);
+        crate::diag::update_checkpoint("instance paths done");
 
         // Poll background file loading messages (progress, completion, error)
         self.poll_file_load_messages(ctx);
+        crate::diag::update_checkpoint("file load messages done");
 
         // Poll file watcher for workspace changes
         self.handle_file_watcher_events();
+        crate::diag::update_checkpoint("file watcher events done");
 
         // Background workspace file index (quick switcher / search-in-files)
         self.sync_workspace_file_index();
+        crate::diag::update_checkpoint("workspace index sync done");
         if self.workspace_file_index.poll() {
             ctx.request_repaint();
         } else if self.workspace_file_index.is_indexing() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        crate::diag::update_checkpoint("workspace index poll done");
 
         // Poll LSP manager for status changes and spawn failures
         self.handle_lsp_events(ctx);
+        crate::diag::update_checkpoint("lsp events done");
 
         // Handle automatic Git status refresh (focus, periodic, debounced)
         self.handle_git_auto_refresh(ctx);
+        crate::diag::update_checkpoint("background polling done");
 
         // Periodic session save for crash recovery
         self.update_session_recovery();
@@ -2926,9 +2965,12 @@ impl eframe::App for FerriteApp {
 
         // Show auto-save recovery dialog if there's a pending recovery
         self.show_auto_save_recovery_dialog(ctx);
+        crate::diag::update_checkpoint("session autosave recovery done");
 
         // Secondary document windows (child viewports)
+        crate::diag::update_checkpoint("secondary windows start");
         self.render_secondary_document_windows(ctx, frame);
+        crate::diag::update_checkpoint("secondary windows done");
 
         // Handle close request from the primary window
         if ctx.input(|i| i.viewport().close_requested())
@@ -2947,6 +2989,7 @@ impl eframe::App for FerriteApp {
         if self.should_exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        crate::diag::update_checkpoint("close resize and exit handling done");
 
         // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
         // Frame Rate Diagnostics (Debug Only)
@@ -3036,7 +3079,7 @@ impl eframe::App for FerriteApp {
             ctx.request_repaint_after(interval);
         }
 
-        crate::diag::frame_end(100);
+        crate::diag::update_end(100);
     }
 
     /// Called when the application is about to close.

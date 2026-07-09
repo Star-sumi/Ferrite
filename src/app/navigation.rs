@@ -763,6 +763,8 @@ impl FerriteApp {
     /// - For workspaces with >50 files: build full index once, then use cached lookups
     /// - For single-file mode: scan files in the current directory
     pub(crate) fn refresh_backlinks(&mut self) {
+        crate::diag::update_checkpoint("refresh_backlinks enter");
+        let _diag_scope = crate::diag::SlowScope::new("refresh_backlinks", 50);
         let current_filename = self
             .state
             .active_tab()
@@ -776,6 +778,7 @@ impl FerriteApp {
         let Some(filename) = current_filename else {
             // No file open or unsaved — clear backlinks
             self.backlinks_panel.clear();
+            crate::diag::update_checkpoint("refresh_backlinks no active file");
             return;
         };
 
@@ -783,22 +786,27 @@ impl FerriteApp {
         if self.backlinks_panel.cached_for_file() == Some(filename.as_str())
             && !self.backlinks_need_refresh
         {
+            crate::diag::update_checkpoint("refresh_backlinks cache hit");
             return;
         }
 
         if let Some(workspace) = &self.state.workspace {
             let root = workspace.root_path.clone();
             let hidden = workspace.hidden_patterns.clone();
+            crate::diag::update_checkpoint("refresh_backlinks collect files start");
             let all_md_files = crate::workspaces::collect_markdown_files(&root, &hidden);
+            crate::diag::update_checkpoint("refresh_backlinks collect files done");
             let file_count = all_md_files.len();
 
             if file_count <= 50 {
                 // Small workspace: scan on demand
+                crate::diag::update_checkpoint("refresh_backlinks on-demand scan start");
                 let backlinks = BacklinkIndex::scan_on_demand(
                     &filename,
                     &all_md_files,
                     current_path.as_deref(),
                 );
+                crate::diag::update_checkpoint("refresh_backlinks on-demand scan done");
                 debug!(
                     "Backlinks (on-demand scan): {} backlinks for '{}'",
                     backlinks.len(),
@@ -812,14 +820,18 @@ impl FerriteApp {
                     || self.state.backlink_index.file_count != file_count
                 {
                     debug!("Building backlink index for {} files...", file_count);
+                    crate::diag::update_checkpoint("refresh_backlinks build index start");
                     self.state.backlink_index.build_from_files(&all_md_files);
+                    crate::diag::update_checkpoint("refresh_backlinks build index done");
                 }
 
+                crate::diag::update_checkpoint("refresh_backlinks lookup start");
                 let mut backlinks = self.state.backlink_index.get_backlinks(&filename);
                 // Filter out self-references
                 if let Some(ref cp) = current_path {
                     backlinks.retain(|e| &e.source_path != cp);
                 }
+                crate::diag::update_checkpoint("refresh_backlinks lookup done");
                 debug!(
                     "Backlinks (cached index): {} backlinks for '{}'",
                     backlinks.len(),
@@ -832,6 +844,7 @@ impl FerriteApp {
             // Single-file mode: scan markdown files in the current file's directory
             if let Some(ref path) = current_path {
                 if let Some(parent) = path.parent() {
+                    crate::diag::update_checkpoint("refresh_backlinks directory scan start");
                     let dir_files: Vec<std::path::PathBuf> = std::fs::read_dir(parent)
                         .into_iter()
                         .flatten()
@@ -842,6 +855,7 @@ impl FerriteApp {
 
                     let backlinks =
                         BacklinkIndex::scan_on_demand(&filename, &dir_files, Some(path));
+                    crate::diag::update_checkpoint("refresh_backlinks directory scan done");
                     debug!(
                         "Backlinks (directory scan): {} backlinks for '{}'",
                         backlinks.len(),
