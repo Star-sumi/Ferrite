@@ -1481,6 +1481,11 @@ impl FerriteApp {
     /// - Periodic refresh every 10 seconds when a workspace is open
     /// - Debounced refresh requests (e.g., after file save)
     pub(crate) fn handle_git_auto_refresh(&mut self, ctx: &egui::Context) {
+        if self.state.git_service.poll_status_refresh() {
+            self.git_auto_refresh.mark_refreshed();
+            ctx.request_repaint();
+        }
+
         // Get window focus state
         let is_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
 
@@ -1489,13 +1494,19 @@ impl FerriteApp {
 
         // Check if git service is active (workspace with git repo)
         let git_active = self.state.git_service.is_open();
+        let refresh_in_progress = self.state.git_service.is_status_refresh_pending();
 
         // Tick the auto-refresh manager
-        if self.git_auto_refresh.tick(git_active) {
-            // Perform the actual refresh
-            self.state.git_service.refresh_status();
-            self.git_auto_refresh.mark_refreshed();
-            trace!("Git status auto-refreshed");
+        if !refresh_in_progress && self.git_auto_refresh.tick(git_active) {
+            if self.state.git_service.request_status_refresh_async() {
+                trace!("Git status auto-refresh scheduled");
+            } else {
+                self.git_auto_refresh.mark_refreshed();
+            }
+        }
+
+        if self.state.git_service.is_status_refresh_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 

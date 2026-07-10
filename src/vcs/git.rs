@@ -9,6 +9,9 @@ use git2::{ErrorCode, Repository, Status, StatusOptions};
 use log::{debug, trace, warn};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn fallback_untracked_status(
     repo: &Repository,
@@ -61,6 +64,38 @@ fn repo_relative_path(path: &Path, repo_root: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+fn collect_visible_statuses(
+    repo: &Repository,
+    repo_root: Option<&Path>,
+    status_scope: Option<&Path>,
+) -> Result<HashMap<PathBuf, GitFileStatus>, git2::Error> {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false)
+        .include_unmodified(false);
+    if let (Some(repo_root), Some(scope)) = (repo_root, status_scope) {
+        if let Some(scope_rel) = repo_relative_path(scope, repo_root) {
+            if !scope_rel.as_os_str().is_empty() {
+                let pathspec = scope_rel.as_os_str().to_string_lossy().replace('\\', "/");
+                opts.pathspec(pathspec);
+            }
+        }
+    }
+
+    let statuses = repo.statuses(Some(&mut opts))?;
+    let mut file_statuses = HashMap::new();
+    for entry in statuses.iter() {
+        if let Some(path) = entry.path() {
+            let status = GitFileStatus::from_git2_status(entry.status());
+            if status.is_visible() {
+                file_statuses.insert(PathBuf::from(path), status);
+            }
+        }
+    }
+    Ok(file_statuses)
 }
 
 #[cfg(windows)]
@@ -199,6 +234,12 @@ impl GitFileStatus {
 // Git Service
 // ─────────────────────────────────────────────────────────────────────────────
 
+struct GitStatusRefreshResult {
+    repo_root: PathBuf,
+    status_scope: Option<PathBuf>,
+    statuses: Result<HashMap<PathBuf, GitFileStatus>, String>,
+}
+
 /// Git integration service.
 ///
 /// Provides methods to query Git repository information including
@@ -216,6 +257,10 @@ pub struct GitService {
     file_statuses: HashMap<PathBuf, GitFileStatus>,
     /// Whether status cache is valid
     cache_valid: bool,
+    /// Receiver for an in-flight background status refresh.
+    status_refresh_rx: Option<Receiver<GitStatusRefreshResult>>,
+    /// Whether another refresh was requested while one was already running.
+    status_refresh_queued: bool,
 }
 
 impl std::fmt::Debug for GitService {
@@ -226,6 +271,11 @@ impl std::fmt::Debug for GitService {
             .field("is_open", &self.repo.is_some())
             .field("file_statuses_count", &self.file_statuses.len())
             .field("cache_valid", &self.cache_valid)
+            .field(
+                "status_refresh_in_progress",
+                &self.status_refresh_rx.is_some(),
+            )
+            .field("status_refresh_queued", &self.status_refresh_queued)
             .finish()
     }
 }
@@ -245,6 +295,8 @@ impl GitService {
             status_scope: None,
             file_statuses: HashMap::new(),
             cache_valid: false,
+            status_refresh_rx: None,
+            status_refresh_queued: false,
         }
     }
 
@@ -270,6 +322,8 @@ impl GitService {
                 self.status_scope = Some(path.to_path_buf());
                 self.repo = Some(repo);
                 self.cache_valid = false;
+                self.status_refresh_rx = None;
+                self.status_refresh_queued = false;
                 Ok(true)
             }
             Err(e) if e.code() == ErrorCode::NotFound => {
@@ -292,6 +346,8 @@ impl GitService {
         self.status_scope = None;
         self.file_statuses.clear();
         self.cache_valid = false;
+        self.status_refresh_rx = None;
+        self.status_refresh_queued = false;
     }
 
     /// Check if a Git repository is currently open.
@@ -346,9 +402,144 @@ impl GitService {
     /// Refresh the file status cache.
     ///
     /// This should be called when files might have changed.
+    #[allow(dead_code)] // Retained for explicit synchronous refresh callers and unit tests.
     pub fn refresh_status(&mut self) {
+        self.status_refresh_rx = None;
+        self.status_refresh_queued = false;
         self.cache_valid = false;
         self.update_status_cache();
+    }
+
+    /// Request a non-blocking status refresh.
+    ///
+    /// The expensive `git status` scan runs on a worker thread. Call
+    /// `poll_status_refresh` from the UI loop to apply the completed result.
+    pub fn request_status_refresh_async(&mut self) -> bool {
+        if self.repo.is_none() {
+            return false;
+        }
+
+        if self.status_refresh_rx.is_some() {
+            self.status_refresh_queued = true;
+            trace!("Git status refresh already running; queued follow-up");
+            return false;
+        }
+
+        self.start_status_refresh_worker()
+    }
+
+    /// Poll the background refresh worker and apply a completed result.
+    pub fn poll_status_refresh(&mut self) -> bool {
+        let Some(rx) = self.status_refresh_rx.take() else {
+            return false;
+        };
+
+        match rx.try_recv() {
+            Ok(result) => {
+                let matches_current_repo = self.repo_root.as_ref() == Some(&result.repo_root)
+                    && self.status_scope == result.status_scope;
+                if matches_current_repo {
+                    match result.statuses {
+                        Ok(statuses) => {
+                            self.file_statuses = statuses;
+                            self.cache_valid = true;
+                            trace!(
+                                "Git status background refresh applied: {} files",
+                                self.file_statuses.len()
+                            );
+                        }
+                        Err(e) => {
+                            self.cache_valid = false;
+                            warn!("Error getting Git statuses: {}", e);
+                        }
+                    }
+                } else {
+                    trace!("Discarded stale Git status refresh result");
+                }
+
+                if self.status_refresh_queued {
+                    self.status_refresh_queued = false;
+                    let _ = self.start_status_refresh_worker();
+                }
+
+                true
+            }
+            Err(TryRecvError::Empty) => {
+                self.status_refresh_rx = Some(rx);
+                false
+            }
+            Err(TryRecvError::Disconnected) => {
+                warn!("Git status background refresh disconnected");
+                if self.status_refresh_queued {
+                    self.status_refresh_queued = false;
+                    let _ = self.start_status_refresh_worker();
+                }
+                false
+            }
+        }
+    }
+
+    /// Whether a background refresh is running or queued.
+    pub fn is_status_refresh_pending(&self) -> bool {
+        self.status_refresh_rx.is_some() || self.status_refresh_queued
+    }
+
+    fn start_status_refresh_worker(&mut self) -> bool {
+        let Some(repo_root) = self.repo_root.clone() else {
+            return false;
+        };
+        let status_scope = self.status_scope.clone();
+        let (tx, rx) = mpsc::channel();
+        self.status_refresh_rx = Some(rx);
+        self.cache_valid = false;
+
+        thread::spawn({
+            let repo_root = repo_root.clone();
+            let status_scope = status_scope.clone();
+            move || {
+                crate::diag::event(
+                    "git_status_background_refresh_start",
+                    format!("root={}", repo_root.display()),
+                );
+                let started = Instant::now();
+                let result = match Repository::open(&repo_root).or_else(|_| {
+                    let discover_path = status_scope.as_deref().unwrap_or(repo_root.as_path());
+                    Repository::discover(discover_path)
+                }) {
+                    Ok(repo) => collect_visible_statuses(
+                        &repo,
+                        Some(repo_root.as_path()),
+                        status_scope.as_deref(),
+                    )
+                    .map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+
+                let elapsed = started.elapsed();
+                if elapsed >= Duration::from_millis(100) {
+                    crate::diag::event(
+                        "git_status_background_refresh_slow",
+                        format!("{}ms", elapsed.as_millis()),
+                    );
+                    warn!(
+                        "slow background git status refresh {}ms",
+                        elapsed.as_millis()
+                    );
+                }
+                crate::diag::event(
+                    "git_status_background_refresh_done",
+                    format!("{}ms", elapsed.as_millis()),
+                );
+
+                let _ = tx.send(GitStatusRefreshResult {
+                    repo_root,
+                    status_scope,
+                    statuses: result,
+                });
+            }
+        });
+
+        true
     }
 
     /// Update the file status cache if needed.
@@ -366,34 +557,16 @@ impl GitService {
             return;
         };
 
-        // Configure status options
-        let mut opts = StatusOptions::new();
-        opts.include_untracked(true)
-            .recurse_untracked_dirs(false)
-            .include_ignored(false)
-            .include_unmodified(false);
-        if let (Some(repo_root), Some(scope)) = (&self.repo_root, &self.status_scope) {
-            if let Some(scope_rel) = repo_relative_path(scope, repo_root) {
-                if !scope_rel.as_os_str().is_empty() {
-                    let pathspec = scope_rel.as_os_str().to_string_lossy().replace('\\', "/");
-                    opts.pathspec(pathspec);
-                }
-            }
-        }
-
         // Get all statuses
         crate::diag::update_checkpoint("git status repo.statuses start");
-        match repo.statuses(Some(&mut opts)) {
+        match collect_visible_statuses(
+            repo,
+            self.repo_root.as_deref(),
+            self.status_scope.as_deref(),
+        ) {
             Ok(statuses) => {
                 crate::diag::update_checkpoint("git status repo.statuses done");
-                for entry in statuses.iter() {
-                    if let Some(path) = entry.path() {
-                        let status = GitFileStatus::from_git2_status(entry.status());
-                        if status.is_visible() {
-                            self.file_statuses.insert(PathBuf::from(path), status);
-                        }
-                    }
-                }
+                self.file_statuses = statuses;
                 trace!(
                     "Git status cache updated: {} files",
                     self.file_statuses.len()
@@ -539,8 +712,6 @@ impl GitService {
 // ─────────────────────────────────────────────────────────────────────────────
 // Git Auto-Refresh
 // ─────────────────────────────────────────────────────────────────────────────
-
-use std::time::{Duration, Instant};
 
 /// Configuration for Git auto-refresh behavior.
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
@@ -843,6 +1014,64 @@ mod tests {
             Some(&GitFileStatus::Modified)
         );
         assert!(!service.cache_valid);
+    }
+
+    #[test]
+    fn test_git_service_async_refresh_does_not_update_cache_before_poll() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        Repository::init(repo_path).unwrap();
+
+        let file_path = repo_path.join("async.txt");
+        fs::write(&file_path, "hello").unwrap();
+
+        let mut service = GitService::new();
+        service.open(repo_path).unwrap();
+
+        let mut refresh = GitAutoRefresh::new();
+        refresh.last_refresh = Some(Instant::now() - GIT_REFRESH_INTERVAL - Duration::from_secs(1));
+        assert!(refresh.tick(true));
+        assert!(service.request_status_refresh_async());
+
+        let statuses_before_poll = service.cached_all_statuses();
+        assert!(
+            !statuses_before_poll.contains_key(&file_path),
+            "async refresh must not update UI-visible cache before poll"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut applied = false;
+        while Instant::now() < deadline {
+            if service.poll_status_refresh() {
+                applied = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(applied, "background status refresh did not complete");
+        let statuses_after_poll = service.cached_all_statuses();
+        assert_eq!(
+            statuses_after_poll.get(&file_path),
+            Some(&GitFileStatus::Untracked)
+        );
+    }
+
+    #[test]
+    fn test_git_service_async_refresh_coalesces_running_refresh() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        Repository::init(repo_path).unwrap();
+
+        let mut service = GitService::new();
+        service.open(repo_path).unwrap();
+
+        let (_tx, rx) = std::sync::mpsc::channel::<GitStatusRefreshResult>();
+        service.status_refresh_rx = Some(rx);
+
+        assert!(!service.request_status_refresh_async());
+        assert!(service.status_refresh_rx.is_some());
+        assert!(service.status_refresh_queued);
     }
 
     #[cfg(windows)]
